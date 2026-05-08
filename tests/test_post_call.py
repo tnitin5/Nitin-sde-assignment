@@ -11,16 +11,31 @@ from unittest.mock import AsyncMock, patch, MagicMock
 from datetime import datetime
 
 from src.services.post_call_processor import PostCallProcessor, PostCallContext
+from src.services.rate_limiter import AcquireDecision, AcquireResult
+
+
+def _always_ok_limiter():
+    limiter = AsyncMock()
+    limiter.try_acquire = AsyncMock(
+        return_value=AcquireDecision(
+            result=AcquireResult.OK, reservation_id="test-rid"
+        )
+    )
+    limiter.finalize = AsyncMock()
+    limiter.release = AsyncMock()
+    return limiter
 
 
 @pytest.mark.asyncio
 async def test_every_call_gets_full_llm_analysis(make_post_call_context):
     """
-    CURRENT BEHAVIOUR: Even a clear "not interested" call gets full LLM analysis.
-    This is the core inefficiency — there is no triage step.
+    CURRENT BEHAVIOUR (pre-triage): every long-transcript call still gets full
+    LLM analysis. The rate limiter gates the call but does not classify it —
+    differentiated processing (hot/cold lanes) is documented in the design
+    but not implemented in code.
     """
     ctx = make_post_call_context("not_interested")
-    processor = PostCallProcessor()
+    processor = PostCallProcessor(rate_limiter=_always_ok_limiter())
 
     with patch.object(processor, "_call_llm", new_callable=AsyncMock) as mock_llm:
         mock_llm.return_value = {
@@ -33,7 +48,6 @@ async def test_every_call_gets_full_llm_analysis(make_post_call_context):
         with patch.object(processor, "_update_interaction_metadata", new_callable=AsyncMock):
             result = await processor.process_post_call(ctx)
 
-        # LLM was called — even though the transcript clearly says "not interested"
         mock_llm.assert_called_once()
         assert result.tokens_used == 1200
 
