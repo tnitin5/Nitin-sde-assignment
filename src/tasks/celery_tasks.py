@@ -104,20 +104,13 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         priority=payload.get("priority", "cold"),
     )
 
-    recording_s3_key = await fetch_and_upload_recording(
+    await fetch_and_upload_recording(
         interaction_id=ctx.interaction_id,
         call_sid=ctx.call_sid,
         exotel_account_id=ctx.exotel_account_id or "",
+        correlation_id=correlation_id,
+        customer_id=ctx.customer_id,
     )
-
-    if recording_s3_key:
-        audit.emit(
-            "recording", "uploaded",
-            correlation_id=correlation_id,
-            interaction_id=interaction_id,
-            customer_id=ctx.customer_id,
-            s3_key=recording_s3_key,
-        )
 
     processor = PostCallProcessor()
     result = await processor.process_post_call(ctx, single_prompt=True)
