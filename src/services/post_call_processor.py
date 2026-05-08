@@ -1,152 +1,168 @@
-"""
-PostCallProcessor — Runs LLM analysis on a completed call transcript.
+"""PostCallProcessor — runs LLM analysis on a completed call transcript.
 
-This is where the LLM quota gets spent. Every call that reaches this class
-consumes ~1,500 tokens on average (see settings.LLM_AVG_TOKENS_PER_CALL).
+Every long-transcript interaction reaches this class. Before the LLM call
+fires, the rate limiter is consulted: if the customer's token budget or
+the platform's last-60s usage cannot cover the estimated cost the call
+is deferred (RateLimitDeferred) and the worker retries it after the
+limiter's suggested delay.
 
-The prompt extracts three things in a single LLM call (single_prompt=True):
-  - call_stage: the outcome/disposition ("rebook_confirmed", "not_interested", etc.)
-  - entities: structured data mentioned in the call (dates, amounts, names)
-  - summary: a human-readable summary for the dashboard
+The estimated token count is reserved with the limiter, the LLM call
+runs, and the actual tokens_used is reconciled via finalize() so the
+sliding window reflects real consumption rather than the estimate.
 
-One design observation: call_stage is usually detectable with high confidence
-from just a few sentences of the transcript — sometimes from a single phrase.
-Full entity extraction and summarisation are only useful if the call had a
-meaningful outcome. Whether that distinction is worth acting on is a question
-worth thinking about.
-
-Another observation: the LLM response includes a `usage` field with the exact
-token count. We log it per call. We don't aggregate it anywhere. We can't
-currently answer "how many tokens did Customer X use this hour?" without
-scanning logs.
+The single_prompt path runs entity extraction, classification and
+summarisation in one call. Splitting them is a future optimisation
+documented in the design.
 """
 
 import json
-import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from src.config import settings
-from src.services.circuit_breaker import circuit_breaker
+from src.services.rate_limiter import (
+    AcquireResult,
+    rate_limiter as default_rate_limiter,
+    RateLimiter,
+)
+from src.utils import audit
 
-logger = logging.getLogger(__name__)
+
+class RateLimitDeferred(Exception):
+    """Raised when the rate limiter declines to admit a call.
+
+    The worker catches this and reschedules with the limiter-supplied
+    retry_after_ms — distinct from a generic processing failure.
+    """
+
+    def __init__(self, decision_result: str, retry_after_ms: int, reason: str):
+        self.decision_result = decision_result
+        self.retry_after_ms = retry_after_ms
+        self.reason = reason
+        super().__init__(f"rate_limit_deferred: {decision_result} ({reason})")
 
 
 @dataclass
 class PostCallContext:
-    """Everything needed to process one completed call."""
     interaction_id: str
     session_id: str
     lead_id: str
     campaign_id: str
-    customer_id: str  # The business using the platform (not the person called)
+    customer_id: str
     agent_id: str
-    call_sid: str     # Exotel's identifier for the call
+    call_sid: str
     transcript_text: str
     conversation_data: dict
-    additional_data: dict  # Arbitrary metadata from the dialler (campaign config, etc.)
+    additional_data: dict
     ended_at: datetime
     exotel_account_id: Optional[str] = None
+    correlation_id: Optional[str] = None
+    priority: str = "cold"
 
 
 @dataclass
 class AnalysisResult:
-    call_stage: str          # Disposition: rebook_confirmed, not_interested, etc.
-    entities: Dict[str, Any] # Structured entities extracted from the transcript
-    summary: str             # Human-readable summary for dashboard display
+    call_stage: str
+    entities: Dict[str, Any]
+    summary: str
     raw_response: Dict[str, Any]
-    tokens_used: int         # Actual tokens consumed — source of truth for billing
+    tokens_used: int
     latency_ms: float
     provider: str
     model: str
 
 
+def estimate_tokens(transcript_text: str) -> int:
+    # ~1.3 tokens per word for input, plus a response budget. Always
+    # pessimistic — the limiter refunds via finalize() once the actual
+    # tokens_used comes back from the provider.
+    word_estimate = int(max(len(transcript_text.split()), 1) * 1.3)
+    return max(word_estimate + 500, settings.LLM_AVG_TOKENS_PER_CALL)
+
+
 class PostCallProcessor:
-    """
-    Runs full LLM analysis on a transcript.
 
-    Currently called for every interaction that isn't a short call.
-    No pre-screening, no quota check before firing, no customer-level budgeting.
-
-    The circuit_breaker.record_postcall_start() call increments a Redis counter
-    used by the dialler's capacity check. But it tracks in-flight tasks, not
-    actual tokens/minute. By the time the circuit breaker trips (at 90% RPM),
-    we've already been 429-ing for a while.
-    """
+    def __init__(self, rate_limiter: Optional[RateLimiter] = None):
+        self._rate_limiter = rate_limiter or default_rate_limiter
 
     async def process_post_call(
         self, ctx: PostCallContext, single_prompt: bool = True
     ) -> AnalysisResult:
-        """
-        Run LLM analysis and write result to interaction_metadata.
+        est_tokens = estimate_tokens(ctx.transcript_text)
 
-        single_prompt=True means we run entity extraction, classification, and
-        summarisation in one LLM call. This was a cost optimisation over an
-        earlier version that made three separate calls. It's the right trade-off.
+        decision = await self._rate_limiter.try_acquire(
+            ctx.customer_id,
+            est_tokens,
+            priority=ctx.priority,
+            correlation_id=ctx.correlation_id,
+            interaction_id=ctx.interaction_id,
+        )
 
-        What this function does NOT do before calling the LLM:
-          - Check whether we're near the tokens/minute limit
-          - Check whether this customer has exceeded their allocated budget
-          - Consider whether this call's outcome even warrants full analysis
-        """
+        if decision.result not in (AcquireResult.OK, AcquireResult.OK_OVERFLOW):
+            raise RateLimitDeferred(
+                decision_result=decision.result.value,
+                retry_after_ms=decision.retry_after_ms,
+                reason=decision.reason,
+            )
 
-        # Tells the circuit breaker an LLM request is in flight.
-        # Note: this increments llm:postcall:rpm but doesn't check it first.
-        # The check happens in circuit_breaker.check_capacity(), which is
-        # called by the dialler — not here, before spending the tokens.
-        await circuit_breaker.record_postcall_start()
+        reservation_id = decision.reservation_id
+        assert reservation_id is not None
 
+        audit.emit(
+            "llm", "analysis_started",
+            correlation_id=ctx.correlation_id,
+            interaction_id=ctx.interaction_id,
+            customer_id=ctx.customer_id,
+            campaign_id=ctx.campaign_id,
+            est_tokens=est_tokens,
+            reservation_id=reservation_id,
+            priority=ctx.priority,
+        )
+
+        prompt = self._build_analysis_prompt(
+            ctx.transcript_text, ctx.additional_data, single_prompt,
+        )
+
+        start_time = datetime.utcnow()
         try:
-            prompt = self._build_analysis_prompt(
-                ctx.transcript_text,
-                ctx.additional_data,
-                single_prompt,
-            )
-
-            start_time = datetime.utcnow()
             response = await self._call_llm(prompt)
-            elapsed_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
-
-            result = self._parse_response(response, elapsed_ms)
-
-            # Result written to interaction_metadata — the dashboard's hot cache.
-            # There is no separate "analysis results" table. The JSONB column on
-            # the interactions row is the only place this data lives.
-            await self._update_interaction_metadata(ctx.interaction_id, result)
-
-            logger.info(
-                "postcall_analysis_complete",
-                extra={
-                    "interaction_id": ctx.interaction_id,
-                    "customer_id": ctx.customer_id,
-                    "campaign_id": ctx.campaign_id,
-                    "call_stage": result.call_stage,
-                    "tokens_used": result.tokens_used,
-                    "latency_ms": result.latency_ms,
-                    # tokens_used is logged here but never written back to any
-                    # counter that could enforce a per-customer budget.
-                },
-            )
-
-            return result
-
         except Exception as e:
-            logger.exception(
-                "postcall_analysis_failed",
-                extra={
-                    "interaction_id": ctx.interaction_id,
-                    "error": str(e),
-                    # If this is a 429 from the LLM provider, the error message
-                    # will say so. But the retry logic above doesn't distinguish
-                    # "retry in 1 second" (rate limit) from "retry in 60 seconds"
-                    # (transient failure) — it always waits 60 seconds.
-                },
+            await self._rate_limiter.release(reservation_id, ctx.customer_id)
+            audit.emit(
+                "llm", "analysis_failed",
+                status="fail",
+                correlation_id=ctx.correlation_id,
+                interaction_id=ctx.interaction_id,
+                customer_id=ctx.customer_id,
+                reservation_id=reservation_id,
+                error=str(e),
             )
             raise
 
-        finally:
-            await circuit_breaker.record_postcall_end()
+        elapsed_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
+        result = self._parse_response(response, elapsed_ms)
+
+        await self._rate_limiter.finalize(
+            reservation_id, result.tokens_used, customer_id=ctx.customer_id,
+        )
+
+        await self._update_interaction_metadata(ctx.interaction_id, result)
+
+        audit.emit(
+            "llm", "analysis_complete",
+            correlation_id=ctx.correlation_id,
+            interaction_id=ctx.interaction_id,
+            customer_id=ctx.customer_id,
+            campaign_id=ctx.campaign_id,
+            call_stage=result.call_stage,
+            tokens_estimated=est_tokens,
+            tokens_used=result.tokens_used,
+            latency_ms=result.latency_ms,
+            reservation_id=reservation_id,
+        )
+
+        return result
 
     def _build_analysis_prompt(
         self,
@@ -154,16 +170,6 @@ class PostCallProcessor:
         additional_data: dict,
         single_prompt: bool,
     ) -> str:
-        """
-        Build the LLM prompt.
-
-        The system prompt asks for three outputs in one JSON object.
-        call_stage is the most important — everything downstream depends on it.
-        entities and summary are useful but secondary.
-
-        If you were thinking about a cheaper "just classify the call_stage" step
-        before the full analysis, this is the prompt you'd be splitting.
-        """
         system_prompt = """You are a call analysis assistant. Analyze the following
 call transcript and extract:
 1. call_stage: The outcome/disposition of the call
@@ -184,20 +190,8 @@ Respond in JSON format:
         )
 
     async def _call_llm(self, prompt: str) -> dict:
-        """
-        Call the configured LLM provider.
-
-        In production this is an httpx POST to the provider's API.
-        A 429 response raises an exception that propagates up to the Celery
-        retry handler — which retries after a fixed 60-second delay regardless
-        of the Retry-After header the provider sends back.
-
-        Mock implementation for the assessment.
-        """
-        # The provider's response includes a `usage` block:
-        # {"prompt_tokens": N, "completion_tokens": M, "total_tokens": N+M}
-        # We surface total_tokens in AnalysisResult but don't write it back
-        # anywhere that could be used for budget tracking or alerting.
+        # Mock — production hits httpx POST to the provider's API and parses
+        # `usage.total_tokens` from the response.
         return {
             "call_stage": "unknown",
             "entities": {},
@@ -220,26 +214,8 @@ Respond in JSON format:
     async def _update_interaction_metadata(
         self, interaction_id: str, result: AnalysisResult
     ) -> None:
-        """
-        Write analysis results into the interaction_metadata JSONB column.
-
-        In production:
-            UPDATE interactions
-            SET interaction_metadata = interaction_metadata || $2::jsonb,
-                updated_at = NOW()
-            WHERE id = $1
-
-        The dashboard reads interaction_metadata directly. There is no separate
-        results table — this JSONB column is the only record of the analysis.
-        If it gets overwritten by a retry, the previous result is gone.
-        """
-        logger.info(
-            "metadata_updated",
-            extra={
-                "interaction_id": interaction_id,
-                "call_stage": result.call_stage,
-            },
-        )
+        # Production: UPDATE interactions SET interaction_metadata = ... WHERE id = $1
+        return
 
 
 post_call_processor = PostCallProcessor()
