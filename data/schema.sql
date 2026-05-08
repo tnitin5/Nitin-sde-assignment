@@ -140,3 +140,157 @@ INSERT INTO interactions (id, session_id, lead_id, campaign_id, customer_id, age
         '{"transcript": [{"role": "agent", "content": "Hello—"}, {"role": "customer", "content": "Wrong number"}]}',
         '{"analysis_status": "pending"}'
     );
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- POST-CALL PIPELINE EXTENSIONS
+--
+-- Schema changes that support rate-limited LLM scheduling, per-customer
+-- budgets, durable job tracking, structured audit, and a dead-letter
+-- queue for permanently failed work.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+
+-- Per-customer budget configuration. Loaded by RateLimiter at startup.
+CREATE TABLE customer_budgets (
+    customer_id UUID PRIMARY KEY,
+    reserved_tpm INT NOT NULL CHECK (reserved_tpm >= 0),
+    reserved_rpm INT NOT NULL CHECK (reserved_rpm >= 0),
+    priority_tier VARCHAR(16) NOT NULL DEFAULT 'silver'
+        CHECK (priority_tier IN ('gold', 'silver', 'bronze')),
+    allow_overflow BOOLEAN NOT NULL DEFAULT TRUE,
+    hot_quota_pct NUMERIC(3,2) NOT NULL DEFAULT 0.30
+        CHECK (hot_quota_pct BETWEEN 0 AND 1),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+
+-- Durable job tracking for post-call processing. Replaces the Redis-only
+-- retry queue for any work that must survive a Redis restart. Workers
+-- claim jobs via SELECT ... FOR UPDATE SKIP LOCKED.
+CREATE TABLE postcall_jobs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    interaction_id UUID NOT NULL UNIQUE REFERENCES interactions(id),
+    customer_id UUID NOT NULL,
+    campaign_id UUID NOT NULL,
+    correlation_id UUID NOT NULL,
+
+    state VARCHAR(32) NOT NULL DEFAULT 'queued',
+    -- queued | in_progress | recording | analyzing | signaling | done
+    -- | rate_limited | recording_pending_reconcile | failed | dlq
+
+    priority VARCHAR(8) NOT NULL DEFAULT 'cold'
+        CHECK (priority IN ('hot', 'cold', 'skip')),
+
+    attempts INT NOT NULL DEFAULT 0,
+    max_attempts INT NOT NULL DEFAULT 5,
+    next_attempt_at TIMESTAMPTZ,
+    last_error TEXT,
+
+    payload JSONB NOT NULL,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_jobs_state_priority_next
+    ON postcall_jobs(priority, state, next_attempt_at)
+    WHERE state IN ('queued', 'rate_limited');
+CREATE INDEX idx_jobs_customer ON postcall_jobs(customer_id);
+CREATE INDEX idx_jobs_correlation ON postcall_jobs(correlation_id);
+
+
+-- Analysis results — one row per attempt, separate from the JSONB hot
+-- cache on interactions.interaction_metadata. Keeps a full history if
+-- a result is ever overwritten or replayed.
+CREATE TABLE analysis_results (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    interaction_id UUID NOT NULL REFERENCES interactions(id),
+    customer_id UUID NOT NULL,
+    attempt INT NOT NULL,
+
+    call_stage VARCHAR(64),
+    entities JSONB,
+    summary TEXT,
+
+    tokens_used INT NOT NULL,
+    latency_ms INT NOT NULL,
+    provider VARCHAR(32) NOT NULL,
+    model VARCHAR(64) NOT NULL,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (interaction_id, attempt)
+);
+
+CREATE INDEX idx_results_customer_created
+    ON analysis_results(customer_id, created_at);
+
+
+-- Audit trail — one row per stage transition. Mirrors the structured
+-- log events from src/utils/audit.py for durable querying.
+CREATE TABLE postcall_audit (
+    id BIGSERIAL PRIMARY KEY,
+    interaction_id UUID NOT NULL,
+    correlation_id UUID NOT NULL,
+    customer_id UUID NOT NULL,
+
+    stage VARCHAR(64) NOT NULL,
+    event VARCHAR(64) NOT NULL,
+    status VARCHAR(16) NOT NULL CHECK (status IN ('ok', 'retry', 'fail')),
+
+    tokens_estimated INT,
+    tokens_actual INT,
+    latency_ms INT,
+    attempt INT,
+    error_message TEXT,
+    metadata JSONB,
+
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_interaction ON postcall_audit(interaction_id);
+CREATE INDEX idx_audit_correlation ON postcall_audit(correlation_id);
+CREATE INDEX idx_audit_customer_created ON postcall_audit(customer_id, created_at);
+
+
+-- Dead-letter queue. Permanently failed jobs land here with full payload
+-- and last error so they can be inspected and replayed manually.
+CREATE TABLE postcall_dlq (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    job_id UUID NOT NULL,
+    interaction_id UUID NOT NULL,
+    customer_id UUID NOT NULL,
+    correlation_id UUID NOT NULL,
+
+    final_state VARCHAR(32) NOT NULL,
+    last_error TEXT,
+    payload JSONB NOT NULL,
+    attempts INT NOT NULL,
+
+    moved_at TIMESTAMPTZ DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ,
+    resolution_note TEXT
+);
+
+CREATE INDEX idx_dlq_unresolved
+    ON postcall_dlq(moved_at) WHERE resolved_at IS NULL;
+
+
+-- New columns on interactions to support the pipeline.
+ALTER TABLE interactions
+    ADD COLUMN correlation_id UUID,
+    ADD COLUMN processing_priority VARCHAR(8),
+    ADD COLUMN recording_state VARCHAR(32) DEFAULT 'pending',
+    ADD COLUMN recording_attempts INT DEFAULT 0;
+
+CREATE INDEX idx_interactions_correlation ON interactions(correlation_id);
+CREATE INDEX idx_interactions_recording_state
+    ON interactions(recording_state)
+    WHERE recording_state IN ('pending', 'failed_pending_reconcile');
+
+
+-- Seed budgets matching the existing seed customers above.
+INSERT INTO customer_budgets (customer_id, reserved_tpm, reserved_rpm, priority_tier) VALUES
+    ('d0000000-0000-0000-0000-000000000001', 30000, 150, 'gold'),
+    ('d0000000-0000-0000-0000-000000000002', 15000, 75, 'silver');
